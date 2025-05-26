@@ -1,4 +1,4 @@
-python-telegram-bot>=20.0  # Specify a version compatible with ApplicationBuilder
+python-telegram-bot>=20.0
 Flask
 gunicorn
-uvicorn # For Gunicorn's async worker
+uvicorn
