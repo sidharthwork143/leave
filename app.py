@@ -6,7 +6,7 @@ from telegram.ext import Updater, CommandHandler, ChatMemberHandler, CallbackCon
 
 # --- CONFIGURATION ---
 # Token aur anya settings environment variables se lenge
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_TOKEN = os.environ.get("7897027139:AAFlhmXq7V5HFP1W5cDBhMFcehQJtWN2ahQ")
 # Render aapko ek URL dega, woh yahan environment variable ke through set hoga
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL") # Example: "https://your-app-name.onrender.com"
 TARGET_GROUP_ID_STR = os.environ.get("TARGET_GROUP_ID")
