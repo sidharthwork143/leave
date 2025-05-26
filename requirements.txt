@@ -1,3 +1,4 @@
-python-telegram-bot
+python-telegram-bot>=20.0  # Specify a version compatible with ApplicationBuilder
 Flask
-gunicorn  # Render par production server ke liye
+gunicorn
+uvicorn # For Gunicorn's async worker
