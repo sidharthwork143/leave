@@ -1,14 +1,20 @@
 import logging
-import os # Environment variables ke liye
-from flask import Flask, request # Webhook ke liye Flask
-from telegram import Update, ChatMember, ChatMemberUpdated, Bot
-from telegram.ext import Updater, CommandHandler, ChatMemberHandler, CallbackContext, Dispatcher
+import os
+import asyncio # For running async setup
+from flask import Flask, request
+from telegram import Update, ChatMember, ChatMemberUpdated
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    ChatMemberHandler,
+    CallbackContext, # Kept for now, can be ContextTypes.DEFAULT_TYPE
+    ContextTypes, # For more precise typing if needed
+)
 
 # --- CONFIGURATION ---
-# Token aur anya settings environment variables se lenge
-BOT_TOKEN = os.environ.get("7897027139:AAFlhmXq7V5HFP1W5cDBhMFcehQJtWN2ahQ")
-# Render aapko ek URL dega, woh yahan environment variable ke through set hoga
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL") # Example: "https://your-app-name.onrender.com"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 TARGET_GROUP_ID_STR = os.environ.get("TARGET_GROUP_ID")
 
 TARGET_GROUP_ID = None
@@ -16,11 +22,9 @@ if TARGET_GROUP_ID_STR:
     try:
         TARGET_GROUP_ID = int(TARGET_GROUP_ID_STR)
     except ValueError:
-        logging.error(f"TARGET_GROUP_ID '{TARGET_GROUP_ID_STR}' sahi integer nahi hai.")
-        # Aap yahan bot ko exit karwa sakte hain ya default None rehne de sakte hain
+        logging.error(f"TARGET_GROUP_ID '{TARGET_GROUP_ID_STR}' is not a valid integer.")
 
-# Port environment variable se, Render ise set karta hai
-PORT = int(os.environ.get("PORT", 8443)) # Default port agar RENDER_PORT set nahi hai
+PORT = int(os.environ.get("PORT", 8443))
 
 # Logging setup
 logging.basicConfig(
@@ -28,17 +32,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Flask app initialize karein
+# Flask app initialize
 app = Flask(__name__)
 
-# --- BOT FUNCTIONS (Pehle jaise hi) ---
+# Global application object for the bot
+# Will be initialized in the main block if BOT_TOKEN is present
+ptb_application: Application | None = None
+
+# --- BOT FUNCTIONS (now async) ---
 
 def extract_status_change(chat_member_update: ChatMemberUpdated):
-    """
-    ChatMemberUpdated object se status change extract karta hai.
-    Returns:
-        Tuple (was_member, is_member) ya None agar koi relevant change nahi hua.
-    """
     status_change = chat_member_update.difference().get("status")
     old_is_member, new_is_member = chat_member_update.difference().get("is_member", (None, None))
 
@@ -58,22 +61,22 @@ def extract_status_change(chat_member_update: ChatMemberUpdated):
         ChatMember.ADMINISTRATOR,
         ChatMember.OWNER,
     ] or new_is_member
-
     return was_member, is_member
 
-def handle_member_left(update: Update, context: CallbackContext) -> None:
-    """
-    Jab koi member group chhodta hai toh yeh function call hota hai.
-    """
+async def handle_member_left(update: Update, context: CallbackContext) -> None:
     logger.info("ChatMemberUpdate received: %s", update.chat_member)
     
+    if not update.chat_member:
+        logger.warning("ChatMemberUpdate received without chat_member object.")
+        return
+
     if TARGET_GROUP_ID and update.chat_member.chat.id != TARGET_GROUP_ID:
-        logger.info(f"Update group {update.chat_member.chat.id} ke liye hai, target group {TARGET_GROUP_ID} nahi. Ignore kar rahe hain.")
+        logger.info(f"Update for group {update.chat_member.chat.id}, not target group {TARGET_GROUP_ID}. Ignoring.")
         return
 
     result = extract_status_change(update.chat_member)
     if result is None:
-        logger.info("Koi relevant status change (member leaving) nahi hua.")
+        logger.info("No relevant status change (member leaving) detected.")
         return
 
     was_member, is_member = result
@@ -81,7 +84,7 @@ def handle_member_left(update: Update, context: CallbackContext) -> None:
     group_name = update.chat_member.chat.title
 
     if was_member and not is_member:
-        logger.info("%s (%s) ne group '%s' chhod diya. Status: %s", 
+        logger.info("%s (%s) left group '%s'. Status: %s", 
                     user_who_left.full_name, user_who_left.id, group_name, update.chat_member.new_chat_member.status)
         
         message_to_user = (
@@ -91,83 +94,119 @@ def handle_member_left(update: Update, context: CallbackContext) -> None:
             "Aapke feedback se humein group ko behtar banane mein madad milegi. धन्यवाद!"
         )
         try:
-            context.bot.send_message(chat_id=user_who_left.id, text=message_to_user)
-            logger.info("User %s ko message bheja gaya.", user_who_left.full_name)
+            await context.bot.send_message(chat_id=user_who_left.id, text=message_to_user)
+            logger.info("Message sent to user %s.", user_who_left.full_name)
         except Exception as e:
             logger.error(
-                "User %s ko message bhejte waqt error: %s. Shayad bot block hai ya user DM nahi le sakta.", 
+                "Error sending message to user %s: %s. Bot might be blocked or user DMs are off.", 
                 user_who_left.full_name, e
             )
     else:
-        logger.info("User %s ke status mein change hua, par woh group chhod kar nahi gaya/gayi. Old status: %s, New status: %s. Was member: %s, Is member: %s",
+        logger.info("Status change for user %s, but not a leave event. Old: %s, New: %s. Was member: %s, Is member: %s",
                     user_who_left.full_name,
                     update.chat_member.old_chat_member.status,
                     update.chat_member.new_chat_member.status,
                     was_member, is_member)
 
-def start_command(update: Update, context: CallbackContext) -> None: # Function ka naam badla to avoid conflict with Flask's app.start
-    """/start command ke liye handler."""
+async def start_command(update: Update, context: CallbackContext) -> None:
     user = update.effective_user
-    update.message.reply_html(
-        rf"Namaste {user.mention_html()}! Main group members ke leave karne par unhe message karne ke liye yahan hoon."
-    )
+    if user and update.message: # Ensure user and message are not None
+        await update.message.reply_html(
+            rf"Namaste {user.mention_html()}! Main group members ke leave karne par unhe message karne ke liye yahan hoon."
+        )
+    else:
+        logger.warning("Start command received with no effective_user or message.")
 
-def error_handler(update: Update, context: CallbackContext) -> None:
-    """Telegram API se errors ko log karega."""
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log Errors caused by Updates."""
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
 
-# --- BOT SETUP & WEBHOOK ---
-# Bot aur Dispatcher ko global scope mein ya function ke through access karna hoga
-if BOT_TOKEN is None:
-    logger.error("BOT_TOKEN environment variable set nahi hai! Bot start nahi ho sakta.")
-    # Exit kar sakte hain ya error raise kar sakte hain
-    # raise ValueError("BOT_TOKEN is not set")
-else:
-    bot = Bot(token=BOT_TOKEN)
-    dispatcher = Dispatcher(bot, None, workers=0) # workers=0 webhook ke liye aam hai
+# --- WEBHOOK SETUP ---
+async def actual_webhook_setup(application_instance: Application):
+    """Sets up the webhook for Telegram."""
+    if not BOT_TOKEN or not WEBHOOK_URL:
+        logger.error("BOT_TOKEN or WEBHOOK_URL not set. Cannot set webhook.")
+        return
+    
+    await application_instance.initialize() # Important for Application setup
+    webhook_full_url = f"{WEBHOOK_URL}/{BOT_TOKEN}"
+    try:
+        # You might want to delete any existing webhook first for clean setup
+        # await application_instance.bot.delete_webhook()
+        await application_instance.bot.set_webhook(url=webhook_full_url)
+        logger.info(f"Webhook successfully set to: {webhook_full_url}")
+    except Exception as e:
+        logger.error(f"Error setting webhook to {webhook_full_url}: {e}")
 
-    # Handlers add karein
-    dispatcher.add_handler(CommandHandler("start", start_command))
-    dispatcher.add_handler(ChatMemberHandler(handle_member_left, ChatMemberHandler.CHAT_MEMBER))
-    dispatcher.add_error_handler(error_handler)
-
-    # Webhook route (Telegram is route par updates POST karega)
-    # URL mein token include karna ek security measure hai, taaki koi aur aapke webhook ko call na kar sake
-    @app.route(f"/{BOT_TOKEN}", methods=["POST"])
-    def webhook():
+def setup_webhook_sync_for_flask():
+    """Synchronous wrapper to call async webhook setup. Called before Flask app runs."""
+    global ptb_application
+    if ptb_application:
         try:
-            update = Update.de_json(request.get_json(force=True), bot)
-            dispatcher.process_update(update)
-        except Exception as e:
-            logger.error(f"Webhook handle karte waqt error: {e}")
-        return "ok", 200 # Telegram ko success response bhejein
+            asyncio.run(actual_webhook_setup(ptb_application))
+        except RuntimeError as e:
+            # This can happen if an event loop is already running,
+            # e.g., in some WSGI server setups or Jupyter.
+            # For Render/Gunicorn, this should generally be fine if called once at startup.
+            logger.warning(f"Could not run async webhook setup (possibly due to existing event loop): {e}")
+            # As a fallback, try to get or create a new loop if needed,
+            # but this can be tricky. The initial asyncio.run should work in most server startup scripts.
+            # loop = asyncio.get_event_loop()
+            # if loop.is_running():
+            #     logger.info("Event loop already running, trying to schedule webhook setup.")
+            #     loop.create_task(actual_webhook_setup(ptb_application))
+            # else:
+            #     loop.run_until_complete(actual_webhook_setup(ptb_application))
 
-    @app.route("/")
-    def index():
-        return "Bot chal raha hai!" # Health check ke liye simple route
-
-def main_setup_webhook():
-    """Webhook set karta hai (Bot start hone par ek baar call karna hota hai)."""
-    if BOT_TOKEN and WEBHOOK_URL:
-        # Pehle se set webhook ko delete karein (optional, par development mein helpful)
-        # bot.delete_webhook() 
-        # Naya webhook set karein
-        success = bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}")
-        if success:
-            logger.info(f"Webhook successfully set kiya gaya: {WEBHOOK_URL}/{BOT_TOKEN}")
-        else:
-            logger.error("Webhook set karne mein error!")
     else:
-        logger.error("BOT_TOKEN ya WEBHOOK_URL set nahi hai. Webhook set nahi kiya ja sakta.")
+        logger.error("Bot application not initialized. Cannot set webhook.")
 
+
+# --- FLASK ROUTES ---
+# Define routes after ptb_application might be initialized or ensure it's checked inside
+if BOT_TOKEN: # Only define webhook route if BOT_TOKEN is present
+    @app.route(f"/{BOT_TOKEN}", methods=["POST"])
+    async def webhook_handler_route(): # Renamed to avoid conflict if any
+        global ptb_application
+        if not ptb_application:
+            logger.error("Bot application not ready to handle webhook.")
+            return "error", 500
+        try:
+            update_json = request.get_json(force=True)
+            update = Update.de_json(update_json, ptb_application.bot)
+            await ptb_application.process_update(update)
+        except Exception as e:
+            logger.error(f"Error handling webhook: {e}")
+        return "ok", 200
+else:
+    logger.error("BOT_TOKEN not found, webhook route not created.")
+
+@app.route("/")
+def index():
+    return "Bot is running!"
+
+# --- MAIN ---
 if __name__ == "__main__":
     if not BOT_TOKEN:
-        print("Kripya BOT_TOKEN environment variable set karein.")
+        print("FATAL: BOT_TOKEN environment variable not set.")
     elif not WEBHOOK_URL:
-        print("Kripya WEBHOOK_URL environment variable set karein (aapke Render app ka URL).")
+        print("FATAL: WEBHOOK_URL environment variable not set (your Render app's URL).")
     else:
-        # Bot start hone par ek baar webhook set karein
-        main_setup_webhook()
-        # Flask development server start karein
-        # Render par, Gunicorn jaise production server ka istemal hoga
+        # Initialize the bot application
+        ptb_application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+        # Add handlers
+        ptb_application.add_handler(CommandHandler("start", start_command))
+        ptb_application.add_handler(ChatMemberHandler(handle_member_left, ChatMemberHandler.CHAT_MEMBER))
+        ptb_application.add_error_handler(error_handler)
+        
+        # Setup webhook (synchronously calling the async setup)
+        # This should be done *before* app.run()
+        setup_webhook_sync_for_flask()
+        
+        # Run Flask app
+        # For Render, Gunicorn will typically run this using a command like:
+        # gunicorn -k uvicorn.workers.UvicornWorker app:app
+        # The -k uvicorn.workers.UvicornWorker is important for async Flask routes.
         app.run(host="0.0.0.0", port=PORT)
